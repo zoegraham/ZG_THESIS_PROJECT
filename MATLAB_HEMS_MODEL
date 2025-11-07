@@ -1,0 +1,1479 @@
+
+%% Housekeeping
+clear cplex
+clearvars
+close all
+clc
+
+%% GENERAL SET UP
+tic;
+setUp
+ampl = AMPL;                     % Create AMPL instance
+ampl.reset;
+ampl.setOption('solver', 'cplex');
+ampl.eval('option version;')
+
+% Load AMPL model
+basef = fileparts(which('HEMS_WIP'));   % anchor file path
+ampl.read([basef filesep 'pv_battery_hems.mod']);
+
+% Time sets
+N   = 48;               % number of half-hours in a day
+Days = 1;               % solve for one day (with 2-day rolling horizon)
+dt  = 0.5;              % hours per slot
+
+% Define 2-day rolling horizon set D = 1..96
+D96 = (1:2*N)';
+D_as_cells = num2cell(D96);
+days = ampl.getSet('D');
+days.setValues(D_as_cells);
+ampl.getParameter('N').setValues(48);
+
+% Battery defaults (catalogue)
+G1 = [6.5 9.8 14];     % kWh: LG Chem 6.5, LG Chem 10, Tesla PW2 (approx usable)
+G2 = [0.6 1.0 0.5];    % min SOC (kWh)
+G3 = [4.2 5.0 5.0];    % kW: max charge/discharge
+G4 = sqrt([0.84 0.84 0.84]);  % eff ~0.916
+G5 = G1/2;             % initial SOC (kWh)
+
+
+%% THIS IS FOR LATER 
+
+global_baseline = zeros(48,1);
+global_flexy_base = zeros(48,1);
+global_PD_day1 = zeros(48,1);
+global_PV_day1 = zeros(48,1);
+global_Flex_KWh = zeros(48,1);
+global_help_Batt = zeros(48,1);
+global_help_EV = zeros(48,1);
+global_Pgplus = zeros(48,1);
+global_Pbplus = zeros(48,1);
+global_Pgminus = zeros(48,1);
+global_Pbminus = zeros(48,1);
+global_Sb = zeros(48,1);
+global_Be = zeros(48,1);
+global_Pebplus = zeros(48,1);
+global_Pebminus = zeros(48,1);
+global_eev= zeros(48,1);
+house_count = 0;
+
+
+%% DATA SET UP
+input_file = 'Data.xlsx';
+
+% --- Discover available dwellings from Sheet1 column-1 (dwelling_index) ---
+T_sheet1_head = readtable(input_file, 'Sheet', 'Sheet1', ...
+    'ReadVariableNames', false, 'TextType','string');
+
+dw_idx_all = double(T_sheet1_head{:,1});
+dw_idx_all = dw_idx_all(isfinite(dw_idx_all));
+DWELLINGS  = unique(dw_idx_all(:))';   % e.g. 1..100
+
+if isempty(DWELLINGS)
+    error('No dwelling_index found on Sheet1 column-1.');
+end
+
+% (Optional) limit to first 100 if file contains more
+DWELLINGS = DWELLINGS(1:min(100, numel(DWELLINGS)));
+
+% ---- OUTPUT COLLECTORS (optional) ----
+K      = numel(DWELLINGS);
+KPIs   = table('Size',[K 6], ...
+               'VariableTypes',{'double','double','double','double','double','double'}, ...
+               'VariableNames',{'dw','Cost_native','Cost_control','Cost_opt','PV_gen_kWh','SelfConsPct'});
+rowK = 0;
+
+% ==== MAIN DWELLINGS LOOP ====
+for kk = 1:K
+    k = DWELLINGS(kk);
+    fprintf('\n===== Running dwelling_index = %d (%d of %d) =====\n', k, kk, K);
+    ampl.eval('reset data tau_min, tau_max, Pload, R;');   % purge any old rows
+    ampl.getSet('J').setValues({});                        % empty the set J itself
+
+    % --- Read Sheet1 with dwelling_index col-1 + [PD, PV, tariff] in cols 3..5 ---
+    % Assumption after your schema change:
+    % Col-1 = dwelling_index, Col-3 = PD, Col-4 = PV, Col-5 = tariff
+    T1 = readtable(input_file, 'Sheet', 'Sheet1', ...
+        'ReadVariableNames', false, 'TextType','string');
+    
+    % Filter rows for this dwelling
+    rows_k = (double(T1{:,1}) == k);
+    T1k    = T1(rows_k, :);
+    
+    % Expect 48 rows for day-1
+    if height(T1k) < 48
+        error('Sheet1: dwelling %d has <48 rows. Found %d.', k, height(T1k));
+    end
+    
+    PD_day1 = double(T1k{1:48, 3});   % kWh/slot
+    PV_day1 = double(T1k{1:48, 4});   % kWh/slot
+    c_g_day = double(T1k{1:48, 5});   % $/kWh 
+    
+    % Sanitize any NaN/Inf numbers go to ZERO
+    PD_day1(~isfinite(PD_day1)) = 0;
+    PV_day1(~isfinite(PV_day1)) = 0;
+    c_g_day(~isfinite(c_g_day)) = 0;
+    
+    % Mirror to 2-day horizon (96 slots)
+    PD = [PD_day1; PD_day1];
+    PV = [PV_day1; PV_day1];
+
+    
+    % Normalize tariff to $/kWh; replicate to 96 slots
+    if mean(c_g_day,'omitnan') > 3
+        c_g_day = c_g_day/100;       % cents -> dollars
+    end
+    c_g_vec   = repmat(c_g_day,2,1);
+    c_g_cells = num2cell(c_g_vec);
+    
+
+    % Determine PV_Size from day-1 (kW AC nominal proxy)
+    pv_day1 = PV(1:48);
+    dt = 0.5;                         % hours per slot
+    if isempty(pv_day1) || all(~isfinite(pv_day1))
+        error('PV input is empty/non-finite for dwelling %d.', k);
+    end
+    PV_Size = round(max(pv_day1, [], 'omitnan')/dt);
+    if ~isfinite(PV_Size)
+        error('Computed PV_Size is non-finite for dwelling %d.', k);
+    end
+    
+    %% EV availability (Sheet: EV_Availability_to_Charge)
+    % New schema: col-1 dwelling_index, col-3 availability (0/1), 48 rows per dwelling
+    Tev = readtable(input_file, 'Sheet', 'EV_Availability_to_Charge', ...
+        'ReadVariableNames', false, 'TextType','string');
+    
+    rows_k = (double(Tev{:,1}) == k);
+    Tevk   = Tev(rows_k, :);
+    if height(Tevk) < 48
+        error('EV_Availability_to_Charge: dwelling %d has <48 rows.', k);
+    end
+    avail48 = double(Tevk{1:48, 3});      % assume availability in col-3
+    avail48 = double(avail48(:) > 0.5);
+    avail_ev_96 = repmat(avail48, 2, 1);
+
+    
+    %% Flexible appliances (TOTAL kWh per day + required half-hour slots)
+    % Excel schema:
+    %   Col-1 = dwelling_index
+    %   Col-2 = Appliance (string)
+    %   Col-3 = Energy_kWh
+    %   Col-4 = Duration_slots  (integer # of 30-min slots)
+    %   Col-5 = Start_slot      (tmin, 1..48)
+    %   Col-6 = End_slot        (tmax, 1..48)
+    Tall = readtable(input_file, 'Sheet','Flexible_Appliances', ...
+        'ReadVariableNames',false, 'TextType','string');
+    
+    rows_k = (double(Tall{:,1}) == k);
+    Tflex = Tall(rows_k, :);
+    
+    if isempty(Tflex)
+        ampl.getSet('J').setValues({});    % ensure empty on this dwelling
+        Nflex   = 0;
+        Jnames2 = {};
+        Jnames  = {};
+        Power_flex=[]; Duration_flex=[]; Start_flex=[]; End_flex=[];
+    else
+
+        % Coerce + rename columns to semantic names
+        Tflex = Tflex(:,1:6);
+        Tflex.Properties.VariableNames = {'dw','name','Energy_kWh','Duration_slots','Start_slot','End_slot'};
+    
+        % Trim names and drop empty names
+        Tflex.name = string(strtrim(Tflex.name));
+        Tflex = Tflex(~ismissing(Tflex.name) & strlength(Tflex.name)>0, :);
+    
+        % Convert numerics
+        Tflex.Energy_kWh     = double(Tflex.Energy_kWh);
+        Tflex.Duration_slots = double(Tflex.Duration_slots);
+        Tflex.Start_slot     = double(Tflex.Start_slot);
+        Tflex.End_slot       = double(Tflex.End_slot);
+    
+        % Guard/clip slots to 1..48 and round where needed
+        Tflex.Duration_slots = max(0, round(Tflex.Duration_slots));
+        Tflex.Start_slot     = max(1, min(48, round(Tflex.Start_slot)));
+        Tflex.End_slot       = max(1, min(48, round(Tflex.End_slot)));
+    
+        % Derived columns to match model’s expectations
+        E_total_kWh = max(0, Tflex.Energy_kWh);                     
+        R_slots     = Tflex.Duration_slots;
+        tmin        = Tflex.Start_slot;
+        tmax        = Tflex.End_slot;
+    
+        % Valid window + positive jobs
+        win_ok = (tmax - tmin + 1) >= R_slots;
+        keep   = (E_total_kWh > 0) & (R_slots >= 1) & win_ok;
+    
+        % Keep only valid rows
+        Tflex = Tflex(keep, :);
+        E_total_kWh = E_total_kWh(keep);
+        R_slots     = R_slots(keep);
+        tmin        = tmin(keep);
+        tmax        = tmax(keep);
+    
+        if isempty(Tflex)
+            ampl.getSet('J').setValues({});    % nothing to schedule on this dwelling
+            Nflex   = 0;
+            Jnames2 = {};
+            Jnames  = {};
+            Power_flex=[]; Duration_flex=[]; Start_flex=[]; End_flex=[];
+        else
+      
+            P_kW = E_total_kWh ./ (R_slots * dt);   
+            
+            % Names for AMPL set J
+            Jnames2 = cellstr(Tflex.name);
+    
+            % IMPORTANT: reset J BEFORE setting members to avoid stale names
+            ampl.getSet('J').setValues({});         % full reset
+            ampl.getSet('J').setValues(Jnames2);    % now set only these names
+    
+            % Push AMPL parameters over set J
+            df = DataFrame(1,'J','Pload');   df.setMatrix(P_kW,      Jnames2); ampl.setData(df);
+            df = DataFrame(1,'J','R');       df.setMatrix(R_slots,   Jnames2); ampl.setData(df);
+            df = DataFrame(1,'J','tau_min'); df.setMatrix(tmin,      Jnames2); ampl.setData(df);
+            df = DataFrame(1,'J','tau_max'); df.setMatrix(tmax,      Jnames2); ampl.setData(df);
+    
+            % For plotting/reporting
+            Nflex         = numel(Jnames2);
+            Jnames        = Jnames2;
+            Power_flex    = P_kW;
+            Duration_flex = R_slots;
+            Start_flex    = tmin;
+            End_flex      = tmax;
+   
+            fprintf('Flex energy [dw %d]: %.6f kWh\n', k, sum(E_total_kWh));
+            % Keep an echo table energy for downstream KPI (same field name used later)
+            Tflex.E_total_kWh = E_total_kWh;
+
+        end
+    end
+    
+    
+    %% INPUT ECHO & AUTO-DETECT (Day-1; all in kWh/slot)
+    PD_kWh_slot = PD(1:N);
+    PV_kWh_slot = PV(1:N);
+    E_fixed_day1_kWh = sum(PD_kWh_slot);
+    E_pv_day1_kWh    = sum(PV_kWh_slot);
+    
+    % Ensure Jnames2 exists; compute declared flex energy
+    if exist('Jnames2','var') && ~isempty(Jnames2)
+        E_flex_declared_day1_kWh = sum(Tflex.E_total_kWh);
+    else
+        Jnames2 = {};
+        E_flex_declared_day1_kWh = 0;
+    end
+    Jnames = Jnames2;
+    
+   
+    %% Push base series to AMPL
+    df = DataFrame(1, 'D', 'Pd');  df.setMatrix(PD / dt, D_as_cells);  ampl.setData(df);   
+    df = DataFrame(1, 'D', 'Ppv'); df.setMatrix(PV / dt, D_as_cells);  ampl.setData(df);   
+    df = DataFrame(1, 'D', 'c_g'); df.setMatrix(c_g_cells, D_as_cells); ampl.setData(df);
+    
+    %% Assign home BESS by PV size (same mapping as before) — NaN-proof & always set
+    
+    % (Keep your original mapping exactly as-is)
+    if (PV_Size <= 4)         % LG Chem 6.5
+        ampl.getParameter('ebM').setValues(G1(1));
+        ampl.getParameter('ebm').setValues(G2(1));
+        ampl.getParameter('PbM').setValues(G3(1));
+        ampl.getParameter('Pbm').setValues(G3(1));
+        ampl.getParameter('etaBc').setValues(G4(1));
+        ampl.getParameter('etaBd').setValues(G4(1));
+        ampl.getParameter('eb1').setValues(G5(1));
+    elseif (PV_Size > 4) && (PV_Size <= 6)   % LG Chem 10 (approx 9.8)
+        ampl.getParameter('ebM').setValues(G1(2));
+        ampl.getParameter('ebm').setValues(G2(2));
+        ampl.getParameter('PbM').setValues(G3(2));
+        ampl.getParameter('Pbm').setValues(G3(2));
+        ampl.getParameter('etaBc').setValues(G4(2));
+        ampl.getParameter('etaBd').setValues(G4(2));
+        ampl.getParameter('eb1').setValues(G5(2));
+    else                                     % Tesla Powerwall 2 (approx 14)
+        ampl.getParameter('ebM').setValues(G1(3));
+        ampl.getParameter('ebm').setValues(G2(3));
+        ampl.getParameter('PbM').setValues(G3(3));
+        ampl.getParameter('Pbm').setValues(G3(3));
+        ampl.getParameter('etaBc').setValues(G4(3));
+        ampl.getParameter('etaBd').setValues(G4(3));
+        ampl.getParameter('eb1').setValues(G5(3));
+    end
+    
+
+    ampl.getParameter('ebN').setValues(0.2 * double(ampl.getParameter('ebM').get()));
+    
+    
+    % PV inverter eff and tariffs
+    ampl.getParameter('etaI').setValues(1.0);
+    ampl.getParameter('c_pv').setValues(0.04);      
+    ampl.getParameter('lambda_batt').setValues(0); % <- no throughput penalty while debugging
+    ampl.getParameter('lambda_ev').setValues(0);   % <- no EV throughput penalty
+    
+    %% EV SETUP
+    E_EV_kWh   = 60;             % EV battery capacity
+    SOCmin_E   = 0.10 * E_EV_kWh;
+    SOCstart_E = 0.40 * E_EV_kWh;
+    SOCtgt_end = 0.00 * E_EV_kWh;  % optional terminal target
+    
+    % Availability (home-plugged) over 96 slots from Excel
+    avail_ev = avail_ev_96;   % already 96-by-1
+    
+    % Departure SOC requirements (derive from availability: first 1->0 drop each day)
+    dep_soc = zeros(2*N,1);
+    if exist('E_EV_kWh','var')==1 && ~isempty(E_EV_kWh)
+        EV_CAP = E_EV_kWh;
+    else
+        %EV_CAP = ampl.getParameter('eevM').get();   % AMPL param copy
+        % CHANGE HERE 
+        EV_CAP = double(ampl.getParameter('eevM').get());   % AMPL param copy
+    
+    
+    end
+    % COULD RELAX THIS ! 
+    target = 0.80 * EV_CAP;
+
+    a = avail_ev(:);
+    drops = find(diff([a(1); a]) == -1);   % index of first "away" slot
+    d1 = drops(drops <= N);
+    if ~isempty(d1), dep_soc(d1(1)) = target; end
+    d2 = drops(drops > N & drops <= 2*N);
+    if ~isempty(d2), dep_soc(d2(1)) = target; end
+    
+    % OLD, HARDCODED CHARGING/DISCHARGIN LIMITS 
+    %Pchg_EV    = 7.2;            % kW
+    %Pdis_EV    = 7.2;            % kW (set 0 to disable V2H)
+    Pchg_EV  = double(ampl.getParameter('PbM').get());   % BESS charge cap (kW)
+    Pdis_EV  = double(ampl.getParameter('Pbm').get());   % BESS discharge cap (kW)
+    etaEvC     = 0.95;
+    etaEvD     = 0.95;
+      
+    % Push EV params
+    ampl.getParameter('eevM').setValues(E_EV_kWh);
+    ampl.getParameter('eevm').setValues(SOCmin_E);
+    ampl.getParameter('eev1').setValues(SOCstart_E);
+    ampl.getParameter('eevN').setValues(SOCtgt_end);
+    ampl.getParameter('PcevM').setValues(Pchg_EV);
+    ampl.getParameter('PdevM').setValues(Pdis_EV);
+    ampl.getParameter('etaEvC').setValues(etaEvC);
+    ampl.getParameter('etaEvD').setValues(etaEvD);
+    
+    % avail_ev{D} and dep_soc{D}
+    df_av = DataFrame(1,'D','avail_ev'); df_av.setMatrix(num2cell(avail_ev), D_as_cells); ampl.setData(df_av);
+    df_ds = DataFrame(1,'D','dep_soc');  df_ds.setMatrix(num2cell(dep_soc), D_as_cells);  ampl.setData(df_ds);
+    baselineEV = false;
+    
+    %% ROLLING HORIZON SOLVE (1-day steps, 2-day window)
+    
+    % Pre-allocate outputs (size N x Days)
+    Pgplus   = zeros(N, Days);  Pgminus = zeros(N, Days);
+    Pbplus   = zeros(N, Days);  Pbminus = zeros(N, Days);
+    sb       = zeros(N, Days);  %dg      = zeros(N, Days);
+    eb       = zeros(N, Days);
+    Pebplus  = zeros(N, Days);  Pebminus= zeros(N, Days);  eev = zeros(N, Days);
+    
+    % For plotting: placeholder for appliance schedule
+    if ~exist('Nflex','var') || isempty(Nflex), Nflex = 0; end
+    xa_mat = zeros(N, max(1, Nflex));
+    
+    for i = 1:Days
+
+        % Window slices (2 days starting at day i)
+        idx = ( (i-1)*N + 1 ) : ( (i+1)*N );
+        Pd_win  = PD(idx);
+        Ppv_win = PV(idx);
+        cg_win  = c_g_vec(idx);
+    
+        % Push windowed data
+        df = DataFrame(1,'D','Pd');   df.setMatrix(Pd_win  / dt, D_as_cells); ampl.setData(df);
+        df = DataFrame(1,'D','Ppv');  df.setMatrix(Ppv_win / dt, D_as_cells); ampl.setData(df);
+        df = DataFrame(1,'D','c_g');  df.setMatrix(num2cell(cg_win), D_as_cells); ampl.setData(df);
+    
+        % EV: departure requirements in this window (derived from availability)
+        dep_soc_win = dep_soc(idx);
+        df_ds = DataFrame(1,'D','dep_soc'); 
+        df_ds.setMatrix(num2cell(dep_soc_win), D_as_cells); 
+        ampl.setData(df_ds);
+    
+        % EV availability (windowed from Excel-derived 96-slot vector)
+        df_av = DataFrame(1,'D','avail_ev'); 
+        df_av.setMatrix(num2cell(avail_ev(idx)), D_as_cells); 
+        ampl.setData(df_av);
+    
+        % Solve (objective: minimize cost)
+        ampl.eval('objective MinCost;');
+        ampl.solve();
+    
+        % Retrieve full 2-day window results (vectors length = 96)
+        Pgplus_full   = read_var(ampl,'Pgplus');
+        Pgminus_full  = read_var(ampl,'Pgminus');
+        Pbplus_full   = read_var(ampl,'Pbplus');
+        Pbminus_full  = read_var(ampl,'Pbminus');
+        sb_full       = read_var(ampl,'sb');
+        %dg_full       = read_var(ampl,'dg');
+        eb_full       = read_var(ampl,'eb');
+        Pebplus_full  = read_var(ampl,'Pebplus');
+        Pebminus_full = read_var(ampl,'Pebminus');
+        eev_full      = read_var(ampl,'eev');
+    
+        % --- Keep only the first day of this window (slots 1..48)
+        Pgplus(:,i)   = Pgplus_full(1:N);
+        Pgminus(:,i)  = Pgminus_full(1:N);
+        Pbplus(:,i)   = Pbplus_full(1:N);
+        Pbminus(:,i)  = Pbminus_full(1:N);
+        sb(:,i)       = sb_full(1:N);
+        %dg(:,i)       = dg_full(1:N);
+        eb(:,i)       = eb_full(1:N);
+        Pebplus(:,i)  = Pebplus_full(1:N);
+        Pebminus(:,i) = Pebminus_full(1:N);
+        eev(:,i)      = eev_full(1:N);
+    
+        % --- Appliance schedule (day-1 only) for plots
+        if ~isempty(Jnames)
+            xa_vals = read_var(ampl,'xa');
+            xa_full_mat = reshape(xa_vals, [length(D96), numel(Jnames)]);
+            xa_mat = xa_full_mat(1:N, :);
+        else
+            xa_mat = zeros(N,1);
+        end
+
+        % === Flexible energy per slot for Day-1 (kWh) ===
+        if ~isempty(Jnames) && ~isempty(xa_mat) && exist('Power_flex','var') && ~isempty(Power_flex)
+            Flex_KWh_day1 = (xa_mat * Power_flex(:)) * dt;   % N x 1, kWh/slot
+        else
+            Flex_KWh_day1 = zeros(N,1);
+        end
+
+        % Energy per job actually scheduled in Day-1 and across 96 slots
+        ones_day1   = sum(xa_full_mat(1:N, :), 1);      % how many active slots in day-1
+        ones_full   = sum(xa_full_mat, 1);              % how many active slots in all 96
+        E_day1_j    = (ones_day1  .* (Power_flex(:)' * dt));  % kWh per job day-1
+        E_full_j    = (ones_full  .* (Power_flex(:)' * dt));  % kWh per job 96 slots
+        E_declared  = Tflex.E_total_kWh(:)';            % kWh per job from Excel
+        E_day1_sum  = sum(E_day1_j);
+        E_full_sum  = sum(E_full_j);
+        E_decl_sum  = sum(E_declared);
+        fprintf('Scheduled Usage (kWh)\n', E_day1_sum);
+        fprintf('\n%.4f\n', E_day1_sum);
+
+        % Per-job summary (prints every job on its own line)
+        if ~isempty(Jnames)
+            fprintf('\nPer-job summary:\n');
+            fprintf('\n');
+            for jj = 1:numel(Jnames)
+                fprintf('Job %2d: %-18s | Energy: %7.4f kWh | Slots: %d\n', ...
+                    jj, Jnames{jj}, E_declared(jj), Duration_flex(jj));
+            end
+        else
+            fprintf('No flexible jobs for this dwelling.\n');
+        end
+
+    
+       
+        % Carry both SOCs into next horizon
+        ampl.getParameter('eb1').setValues( eb_full(N) );
+        ampl.getParameter('eev1').setValues( eev_full(N) );
+    end
+    
+    % Collapse outputs to vectors (Days==1 case)
+    Pgplus  = Pgplus (:);
+    Pgminus = Pgminus(:);
+    Pbplus  = Pbplus (:);
+    Pbminus = Pbminus(:);
+    sb      = sb     (:);
+    %dg      = dg     (:);
+    eb      = eb     (:);
+    Pebplus = Pebplus(:);
+    Pebminus= Pebminus(:);
+    eev     = eev    (:);
+    
+    % Persist Day-1 flex energy (kWh/slot) computed in-loop
+    if exist('Flex_KWh_day1','var')
+        Flex_KWh = Flex_KWh_day1;      % N x 1
+    else
+        Flex_KWh = zeros(N,1);
+    end
+
+
+    
+    % Time labels
+    Time = strings(N,1);
+    for s = 1:N
+        hh = floor((s-1)*dt);
+        mm = mod((s-1)*dt*60, 60);
+        Time(s) = sprintf('%02d:%02d', hh, mm);
+    end
+
+    
+    %% REPLACEMENT FROM HERE %%
+    % New schema for BASELINE: col-1 dwelling_index, col-3 baseline_native_kWh, col-4 flex_headroom_kWh (if present)
+    Tbl = readtable(input_file, 'Sheet', 'BASELINE', ...
+        'ReadVariableNames', false, 'TextType','string');
+    rows_k = (double(Tbl{:,1}) == k);
+    Tblk   = Tbl(rows_k, :);
+    if height(Tblk) < 48
+        error('BASELINE: dwelling %d has <48 rows.', k);
+    end
+    
+    % Column guards: baseline in col-3; flex-headroom in col-4 if it exists
+    BaselineNative_kwh = double(Tblk{1:48, 4});                % kWh/slot
+    if size(Tblk,2) >= 4
+        flexy_base_kWh = double(Tblk{1:48, 5});                % kWh/slot (optional)
+    else
+        flexy_base_kWh = zeros(48,1);
+    end
+    flexy_base_kWh(~isfinite(flexy_base_kWh)) = 0;
+    
+    
+    %% Sanity checks / prints:
+
+    
+    help_Batt    = ((Pbminus) - (Pgminus)) * dt;
+    help_EV      = ((Pebminus) - (Pebplus)) * dt;
+
+    % NEW ! 
+    sum_Fixed   = sum(PD_day1);
+    sum_PV      = sum(PV_day1);
+    sum_Flex    = E_day1_sum;
+    sum_Batt    = sum(help_Batt);
+    sum_EV      = sum(help_EV);
+    sum_BaseNat = sum(BaselineNative_kwh);
+    
+    fprintf('\n------ PRE-HEMS OVERVIEW (dw %d) ------\n', k);
+    fprintf('Baseline Usage (no BESS or EV): %8.4f\n', sum_BaseNat);
+    fprintf('PV generation                 : %8.4f\n', sum_PV);
+    
+    fprintf('\n------ POST-HEMS OVERVIEW (dw %d) ------\n', k);
+    fprintf('Total demand              : %8.4f\n', sum_Flex + sum_Fixed);
+    fprintf('Fixed demand              : %8.4f\n', sum_Fixed);
+    fprintf('Flex demand               : %8.4f\n', sum_Flex);
+    fprintf('PV generation             : %8.4f\n', sum_PV);
+    fprintf('Battery net (+disch)      : %8.4f\n', sum_Batt);
+    fprintf('EV net (+V2H, -charge)    : %8.4f\n', sum_EV);
+    
+    %% CSV (requested + 1)
+    % Columns:
+    %  A  Time
+    %  B  PV_kWh
+    %  C  Baseline (native, no EV/BESS) kWh
+    %  D  Fixed_KWh
+    %  E  Flex_KWh
+    %  F  Battery net kWh (discharge = +, charge = -)
+    %  G  EV net kWh (V2H = +, charge = -)
+    %  H  Control baseline import kWh (reference)
+    %  I  GridImport_Opt_kWh
+    %  J  GridExport_Opt_kWh
+    %  K  NetGrid_Opt_KWh
+    
+  
+    T = table(Time, PV_day1, BaselineNative_kwh, PD_day1, Flex_KWh, ...
+              help_Batt, help_EV,'VariableNames', {'Time','PV_KWh','Baseline_KWh','Fixed_KWh','Flex_KWh', 'Batt_KWh','EV_KWh'});
+
+    % outcsv = fullfile(basef, sprintf('HEMS_day1_slot_summary_dw%03d.csv', k));
+    % writetable(T, outcsv);
+    % fprintf('Wrote CSV: %s\n', outcsv);
+   
+  
+    %% DATA VISUALISATION
+    
+    % Safety: ensure column vectors of length N
+    BaselineNative_kwh = BaselineNative_kwh(:);
+    Fixed_kWh          = PD_day1(:);    
+    Flex_kWh           = Flex_KWh(:);
+    
+    if numel(BaselineNative_kwh) ~= N || numel(Fixed_kWh) ~= N || numel(Flex_kWh) ~= N
+        error('Size mismatch before plotting: baseline=%d, fixed=%d, flex=%d, expected N=%d', ...
+            numel(BaselineNative_kwh), numel(Fixed_kWh), numel(Flex_kWh), N);
+    end
+    
+    % Define the series
+    pre_hems  = BaselineNative_kwh - Fixed_kWh;  % kWh per slot implied as "flex" in baseline
+    post_hems = Flex_kWh;                        % kWh per slot actually scheduled by HEMS
+    
+    % (Optional) clean tiny numerical noise and negative artefacts
+    tol = 1e-9;
+    pre_hems(abs(pre_hems) < tol) = 0;
+    post_hems(abs(post_hems) < tol) = 0;
+
+    
+    % (Optional) quick consistency check
+    s_pre  = sum(pre_hems);
+    s_post = sum(post_hems);
+    if abs(s_pre - s_post) > 1e-6
+        fprintf('WARN: Sum(pre_hems)=%.6f vs Sum(post_hems)=%.6f (dw %d)\n', s_pre, s_post, k);
+    end
+    
+
+    %% ===== PLOTS (compatible with current code/vars) =====
+    n  = 1:N; 
+    t  = (1:N)'; 
+    NN = N;
+    
+    % Convenience vectors (all Day-1)
+    price_vec = cell2mat(c_g_cells(1:N));     % $/kWh
+    PV_day1   = PV(1:N);                      % kWh/slot
+    PD_day1   = PD(1:N);                      % kWh/slot
+    
+    % Grid (kW) and energy (kWh/slot)
+    Pgnet = Pgplus - Pgminus;                 % kW (import minus export)
+    Egplus  = Pgplus  * dt;                   % kWh/slot
+    Egminus = Pgminus * dt;                   % kWh/slot
+    
+    % EV (energy per slot and SOC)
+    Eev_chg = Pebplus  * dt;                  % kWh/slot (+charge)
+    Eev_dis = Pebminus * dt;                  % kWh/slot (+discharge)
+    ev_soc  = eev(1:N);                       % kWh
+    avail1  = avail48(:);                     % availability (0/1) for Day-1
+    dep1    = zeros(N,1); 
+    if exist('dep_soc','var') && numel(dep_soc) >= N
+        dep1 = dep_soc(1:N);                  % kWh target at departure slot (0 otherwise)
+    end
+    
+    % Flexible appliance power matrix (kW) per job (if any)
+    if exist('xa_mat','var') && ~isempty(xa_mat) && exist('Power_flex','var') && ~isempty(Power_flex)
+        flexible_power = xa_mat .* (ones(N,1)*Power_flex(:)');   % N x Nflex, kW
+        % Total flexible energy per slot (kWh)
+        %Flex_KWh = (xa_mat * Power_flex(:)) * dt;                   % N x 1, kWh
+
+    else
+        flexible_power = zeros(N, max(1,exist('Nflex','var')*Nflex));
+        %Flex_KWh       = zeros(N,1);   % no flexible energy
+
+    end
+
+    
+    % THIS SEEMS OKAY!
+    total_energy_kWh = Fixed_kWh + Flex_kWh;   % kWh/slot
+ 
+   
+    
+    %% 1) Flexible appliances schedule 
+    figure('Name','Appliance schedule');
+
+    % clamp to binary color range so OFF=0, ON=1 map nicely
+    imagesc(xa_mat', [0 1]); 
+    colormap(gray(2));                          % two-level grayscale
+    cb = colorbar; set(cb,'Ticks',[0 1], 'TickLabels',{'OFF','ON'});
+    set(gca,'YDir','normal','FontSize',10);
+    set(gca,'YDir','normal','FontSize',10,'TickLabelInterpreter','none');
+
+    xlabel('Time (half-hours)'); 
+    ylabel('Appliance');
+    title('Flexible Appliance ON/OFF Schedule');
+
+    % Y ticks & labels (avoid mismatches)
+    nApps = size(xa_mat,2);
+    if exist('Jnames','var') && ~isempty(Jnames)
+        % limit ticks so labels count == ticks count
+        yticks(1:nApps);
+        yticklabels(Jnames(:));                 % expects nApps labels
+    else
+        yticks(1);
+        yticklabels({'None'});
+    end
+
+
+    %%  2) Flexible power (per job) 
+    figure('Name','Flexible power'); hold on;
+    if ~isempty(flexible_power)
+        for j = 1:size(flexible_power,2)
+            stairs(1:N, flexible_power(:, j), 'LineWidth', 2);
+        end
+    else
+        stairs(1:N, zeros(N,1), 'LineWidth',2);
+    end
+    xlabel('Time (half-hours)'); ylabel('Power (kW)');
+    title('Flexible Appliance Power Consumption (Step)');
+    if exist('Jnames','var') && ~isempty(Jnames)
+%        legend(Jnames, 'Location','EastOutside');
+        legend(strrep(Jnames,'_','\_'), 'Location','EastOutside');
+
+    end
+    set(gca,'FontSize',10,'XTick',2*[0 6 12 18 24],'XTickLabel',{'0','6','12','18','24'},'XLim',[1 N]);
+    box on; grid on; hold off;
+
+    %%
+
+% 
+% % --- Put this right before your EV power plot ---
+% 
+% tol_plot = 1e-6;
+% Pev_chg = Pebplus(1:N);   Pev_chg(abs(Pev_chg) < tol_plot) = 0;
+% Pev_dis = Pebminus(1:N);  Pev_dis(abs(Pev_dis) < tol_plot) = 0;
+% 
+% Pev_dis_signed = -Pev_dis;                 % show discharge as negative
+% t_h = (0:N-1)'*dt;
+% xt  = 0:2:24;
+% 
+% figure('Name','EV Charge / Discharge (signed)','Color','w'); hold on;
+% stairs(t_h, Pev_chg,        'LineWidth',1.8);   % +kW
+% stairs(t_h, Pev_dis_signed, 'LineWidth',1.8);   % –kW
+% yline(0,'k:');
+% xlabel('Hour'); ylabel('Power (kW)');
+% title('EV Charge (+) and Discharge (–)');
+% legend('Charge','Discharge (V2H)');
+% set(gca,'XTick',xt,'XLim',[0 24]); grid on; box on;
+% mx = max([Pev_chg(:); Pev_dis(:); 1e-6]);
+% ylim(1.1*[-mx, mx]);
+% hold off;
+% 
+% 
+
+    %%
+    % %% 3) Multi-panel (grid, BESS, demand, PV, tariff) 
+    % fig1 = figure('Name','Multi-panel'); fig1.Units='centimeters'; fig1.Position=[10 10 18 12]; fig1.Color='white';
+    % 
+    % subplot(3,2,1); stairs(n, Pgnet); title('Grid Power (net)');
+    % set(gca,'FontSize',8,'XTickLabel',{'0','6','12','18','24'},'XTick',2*[0 6 12 18 24]);
+    % ymax = max(Pgnet); if isempty(ymax)||isnan(ymax)||ymax<=0, ymax=1; end
+    % yline(0,'k:'); %ylim([min(Pgnet)*1.1, max(Pgnet)*1.1]);
+    % xlim([1 NN]); ylim([min(min(Pgnet),0) ymax*1.2]); xlabel('Hours'); ylabel('P (kW)'); box on;
+    % 
+    % subplot(3,2,2); plot(n, eb); title('Battery State of Charge');
+    % set(gca,'FontSize',8,'XTickLabel',{'0','6','12','18','24'},'XTick',2*[0 6 12 18 24]);
+    % xlim([1 NN]); ylim([0 max(eb)*1.1]); xlabel('Hours'); ylabel('E (kWh)'); box on;
+    % 
+    % subplot(3,2,3); hold on; stairs(n, Pbplus); stairs(n, Pbminus);
+    % title('Battery Charge/Discharge'); set(gca,'FontSize',8,'XTickLabel',{'0','6','12','18','24'},'XTick',2*[0 6 12 18 24]);
+    % ymax = max([Pbplus(:); Pbminus(:)]); if isempty(ymax)||isnan(ymax)||ymax<=0, ymax=1; end
+    % xlim([1 NN]); ylim([0 ymax*1.1]); xlabel('Hours'); ylabel('P (kW)'); box on; legend('charge','discharge');
+    % 
+    % 
+    % % --- Demand: Fixed (black), Flexible (blue), Total (red) ---
+    % subplot(3,2,4); cla; hold on;
+    % 
+    % % Plot TOTAL first so it sits behind the components
+    % hTot  = stairs(n, total_energy_kWh, 'r-', 'LineWidth', 1.2);
+    % 
+    % % Plot components on top
+    % hFix  = stairs(n, Fixed_kWh,        'k-', 'LineWidth', 1.6);
+    % hFlex = stairs(n, Flex_KWh,         'b-', 'LineWidth', 1.6);
+    % 
+    % title('Demand: Fixed (black), Flexible (blue), Total (red)');
+    % set(gca,'FontSize',8, ...
+    %         'XTick',      2*[0 6 12 18 24], ...
+    %         'XTickLabel', {'0','6','12','18','24'});
+    % xlim([1 NN]);
+    % ylim([0 1.1*max([total_energy_kWh(:); eps])]);
+    % xlabel('Hours'); ylabel('E (kWh/slot)');
+    % box on;
+    % 
+    % legend([hFix hFlex hTot], {'Fixed','Flexible','Total'}, 'Location','NorthWest');
+    % hold off;
+    % % 
+    % % subplot(3,2,4); hold on;
+    % % stairs(n, Fixed_kWh, 'k', 'LineWidth', 1.2);           % kWh/slot
+    % % stairs(n, Flex_kWh,   'b', 'LineWidth', 1.2);           % kWh/slot
+    % % stairs(n, total_energy_kWh, 'r', 'LineWidth', 1.4);     % kWh/slot
+    % % title('Demand: Fixed (black), Flexible (blue), Total (red)');
+    % % set(gca,'FontSize',8,'XTickLabel',{'0','6','12','18','24'},'XTick',2*[0 6 12 18 24]);
+    % % xlim([1 NN]); ylim([0 max(max(total_energy_kWh),eps)*1.1]); xlabel('Hours'); ylabel('E (kWh/slot)'); 
+    % % box on; legend({'Fixed','Flexible','Total'},'Location','NorthWest');
+    % 
+    % subplot(3,2,5); plot(n, PV_day1); title('PV Output');
+    % set(gca,'FontSize',8,'XTickLabel',{'0','6','12','18','24'},'XTick',2*[0 6 12 18 24]);
+    % xlim([1 NN]); ylim([0 max(PV_day1)*1.1]); xlabel('Hours'); ylabel('E (kWh/slot)'); box on;
+    % 
+    % subplot(3,2,6); stairs(n, price_vec);
+    % title('Retail Tariff'); set(gca,'FontSize',8,'XTickLabel',{'0','6','12','18','24'},'XTick',2*[0 6 12 18 24]);
+    % xlim([1 NN]); ylim([0 1.2*max(price_vec)]); xlabel('Hours'); ylabel('c ($/kWh)'); box on;
+
+%     %% 3) Multi-panel (BESS)
+%     % === BESS & Tariff (3x1) ===
+%     % x-axis in hours
+%     if ~exist('dt','var') || isempty(dt), dt = 0.5; end
+%     if ~exist('N','var')  || isempty(N),  N  = 48;  end
+%     t_h = (0:N-1)'*dt;              % 0,0.5,...,24
+%     xt  = 0:2:24;
+% 
+%     figBT = figure('Name','BESS & Tariff (3x1)');
+%     figBT.Units = 'centimeters';
+%     figBT.Position = [10 10 18 16];
+%     figBT.Color = 'white';
+% 
+%     % (1) BESS State of Charge
+%     subplot(3,1,1);
+%     plot(t_h, eb, 'LineWidth', 1.6);
+%     title('Battery State of Charge');
+%     ylabel('E (kWh)');
+%     xlabel('Hour');
+%     set(gca,'FontSize',8,'XTick',xt,'XLim',[0 24]);
+%     ylim([0, max([eb(:); eps])*1.1]);
+%     grid on; box on;
+% 
+%     % (2) BESS Charge / Discharge (kW)
+%     subplot(3,1,2); hold on;
+%     stairs(t_h, Pbplus,  'LineWidth', 1.6);   % charge (+)
+%     stairs(t_h, Pbminus, 'LineWidth', 1.6);   % discharge (+)
+%     title('Battery Charge / Discharge');
+%     ylabel('P (kW)'); xlabel('Hour');
+%     set(gca,'FontSize',8,'XTick',xt,'XLim',[0 24]);
+%     ymax = max([Pbplus(:); Pbminus(:); 1]);
+%     ylim([0, 1.1*ymax]);
+%     legend({'Charge','Discharge'}, 'Location','northeast');
+%     grid on; box on; hold off;
+% 
+%     % (3) Retail Tariff ($/kWh)
+%     subplot(3,1,3);
+%     stairs(t_h, price_vec, 'LineWidth', 1.6);
+%     title('Retail Tariff');
+%     ylabel('$/kWh'); xlabel('Hour');
+%     set(gca,'FontSize',8,'XTick',xt,'XLim',[0 24]);
+%     ylim([0, 1.2*max([price_vec(:); eps])]);
+%     grid on; box on;
+% 
+%     % Make fonts consistent
+%     set(findall(figBT,'Type','axes'),'FontName','Helvetica');
+% 
+% % 
+% 
+%     %% 4) PV vs Total demand 
+%     figure('Name','PV vs Total demand'); hold on;
+%     stairs(n, PV_day1,'LineWidth',1.2);                  
+%     stairs(n, total_energy_kWh(1:N),'LineWidth',1.8);    
+%     ylabel('Energy (kWh/slot)');
+%     xlabel('Time (half-hours)'); title('PV Output vs. Total Demand');
+%     legend({'PV Output','Total Demand'},'Location','NorthWest');
+%     set(gca,'FontSize',10,'XTick',2*[0 6 12 18 24],'XTickLabel',{'0','6','12','18','24'},'XLim',[1 N]);
+%     grid on; box on; hold off;
+% 
+%     %% 5) Grid Facing Stuff 
+% 
+%     % Convert kW -> kWh/slot for assets
+%     Eev_chg = Pebplus(1:N)  * dt;   % + charge
+%     Eev_dis = Pebminus(1:N) * dt;   % + discharge
+%     Eb_chg  = Pbplus(1:N)   * dt;   % + charge
+%     Eb_dis  = Pbminus(1:N)  * dt;   % + discharge
+% 
+%     figure('Name','Demand + Assets (energy per slot)','Color','w'); hold on;
+% 
+%     % Demand (energy per slot)
+%     stairs(n, Fixed_kWh, 'k-', 'LineWidth', 1.3);            % fixed
+%     stairs(n, Flex_kWh,  'b-', 'LineWidth', 1.3);            % flexible
+% 
+%     % EV flows (plot discharge as negative for clarity)
+%     stairs(n,  Eev_chg,  '--', 'LineWidth', 1.6);            % EV charge (+)
+%     stairs(n, -Eev_dis,  '--', 'LineWidth', 1.6);            % EV discharge (-)
+% 
+%     % BESS flows (plot discharge as negative)
+%     stairs(n,  Eb_chg,   ':',  'LineWidth', 1.8);            % BESS charge (+)
+%     stairs(n, -Eb_dis,   ':',  'LineWidth', 1.8);            % BESS discharge (-)
+% 
+%     % Axes cosmetics
+%     yline(0,'k:');
+%     xlabel('Hours'); ylabel('E (kWh/slot)');
+%     title('Demand (Fixed/Flexible) + EV/BESS Charge/Discharge');
+%     set(gca,'FontSize',10,'XTick',2*[0 6 12 18 24],'XTickLabel',{'0','6','12','18','24'});
+%     xlim([1 NN]);
+% 
+%     % Y-limits: cover demand plus absolute asset flows
+%     ymax = max([Fixed_kWh(:); Flex_kWh(:); Eev_chg(:); Eev_dis(:); Eb_chg(:); Eb_dis(:); 1e-6]);
+%     ylim([-1.1*ymax, 1.1*ymax]);
+% 
+%     box on; grid on;
+%     legend({'Fixed','Flexible','EV charge','EV discharge','BESS charge','BESS discharge'}, ...
+%            'Location','NorthWest');
+%     hold off;
+% % 
+% 
+% 
+% 
+% % 
+% %% 6 
+% 
+% 
+%     % === EV behaviour (3x1): SoC + availability/targets, power flows, tariff ===
+%     if ~exist('dt','var') || isempty(dt), dt = 0.5; end
+%     if ~exist('N','var')  || isempty(N),  N  = 48;  end
+%     t_h   = (0:N-1)'*dt;                 % hours: 0..24
+%     xt    = 0:2:24;
+% 
+%     % Day-1 slices / convenience
+%     ev_soc   = eev(1:N);                 % kWh
+%     Pev_chg  = Pebplus(1:N);             % kW (+ charge)
+%     Pev_dis  = Pebminus(1:N);            % kW (+ V2H)
+%     avail    = avail48(1:N);             % 0/1 availability
+%     dep1     = zeros(N,1);
+%     if exist('dep_soc','var') && numel(dep_soc) >= N, dep1 = dep_soc(1:N); end
+%     dep_idx  = find(dep1 > 0);           % departure slots (if any)
+% 
+%     figEV = figure('Name','EV Behaviour (3x1)','Color','w','Units','centimeters','Position',[8 8 20 18]);
+% 
+%     % (1) EV SoC with availability shading and departure targets
+%     subplot(3,1,1); hold on;
+%     % Shade "available at home" intervals
+%     runs = [find(diff([0; avail(:)])==1), find(diff([avail(:); 0])==-1)]; % [start,end] rows
+%     for r = 1:size(runs,1)
+%         s = runs(r,1); e = runs(r,2);
+%         patch([t_h(s) t_h(e) t_h(e) t_h(s)], ...
+%               [0 0 max([ev_soc; eps])*1.1 max([ev_soc; eps])*1.1], ...
+%               [0.9 0.9 0.95], 'EdgeColor','none', 'HandleVisibility','off');
+%     end
+%     % SoC line
+%     plot(t_h, ev_soc, 'LineWidth', 1.8);
+%     % Departure targets (if any)
+%     if ~isempty(dep_idx)
+%         plot(t_h(dep_idx), dep1(dep_idx), 'rx', 'MarkerSize',8, 'LineWidth',1.4, 'DisplayName','Departure target');
+%         for kx = dep_idx(:)'
+%             xline(t_h(kx), 'k:', 'HandleVisibility','off');
+%         end
+%         legend({'EV SoC','Departure target'}, 'Location','northeast');
+%     else
+%         legend({'EV SoC'}, 'Location','northeast');
+%     end
+%     title('EV State of Charge (shaded = home/available)');
+%     ylabel('Energy (kWh)'); xlabel('Hour');
+%     set(gca,'XTick',xt,'XLim',[0 24],'FontSize',9);
+%     ylim([0, 1.1*max([ev_soc(:); dep1(:); eps])]); grid on; box on; hold off;
+% 
+%     % (2) EV power flows (charge / V2H discharge)
+%     subplot(3,1,2); hold on;
+%     stairs(t_h, Pev_chg, 'LineWidth',1.6);      % charge (+kW)
+%     stairs(t_h, Pev_dis, 'LineWidth',1.6);      % discharge (+kW)
+%     title('EV Charge / Discharge Power');
+%     ylabel('Power (kW)'); xlabel('Hour');
+%     set(gca,'XTick',xt,'XLim',[0 24],'FontSize',9);
+%     ymax = max([Pev_chg(:); Pev_dis(:); 1e-6]); ylim([0 1.1*ymax]);
+%     legend({'Charge','Discharge (V2H)'}, 'Location','northeast');
+%     grid on; box on; hold off;
+% 
+%     % (3) Retail tariff (and optional PV overlay)
+%     subplot(3,1,3); hold on;
+%     stairs(t_h, price_vec(1:N), 'LineWidth',1.6, 'DisplayName','Tariff ($/kWh)');
+%     % Optional: overlay PV to discuss “charging in solar window”
+%     if exist('PV_day1','var') && ~isempty(PV_day1)
+%         yyaxis right; stairs(t_h, PV_day1(1:N), 'LineWidth',1.2, 'DisplayName','PV (kWh/slot)');
+%         ylabel('PV (kWh/slot)'); ylim([0 1.1*max([PV_day1(1:N); eps])]);
+%         yyaxis left; ylabel('$/kWh'); % switch back for labeling
+%         legend('Location','northeast');
+%     else
+%         ylabel('$/kWh');
+%     end
+%     title('Retail Tariff (and PV if available)');
+%     xlabel('Hour');
+%     set(gca,'XTick',xt,'XLim',[0 24],'FontSize',9);
+%     ylim([0 1.2*max([price_vec(1:N); eps])]); grid on; box on; hold off;
+% 
+%     set(findall(figEV,'Type','axes'),'FontName','Helvetica');
+
+
+
+    %% LIST APPENDING
+
+    global_baseline = global_baseline+ BaselineNative_kwh;
+    global_flexy_base = global_flexy_base + flexy_base_kWh; 
+    global_PD_day1 = global_PD_day1 + PD_day1;
+    global_PV_day1 = global_PV_day1 + PV_day1;
+    global_Flex_KWh = global_Flex_KWh + Flex_KWh;
+    global_help_Batt = global_help_Batt + help_Batt;
+    global_help_EV = global_help_EV + help_EV;
+    global_Pgplus = global_Pgplus + Pgplus;
+    global_Pbplus = global_Pbplus + Pbplus;
+    global_Pgminus = global_Pgminus + Pgminus;
+    global_Pbminus = global_Pbminus + Pbminus;
+    global_Sb = global_Sb + sb;
+    global_Be = global_Be + eb;
+    global_Pebplus = global_Pebplus + Pebplus;
+    global_Pebminus = global_Pebminus + Pebminus;
+    global_eev= global_eev + eev;
+    house_count = house_count + 1;
+
+
+end % ===== end dwellings loop =====
+
+% (optional) write a KPI summary across houses
+writetable(KPIs, fullfile(basef, 'HEMS_KPIs_by_dwelling.csv'));
+
+
+
+
+
+
+
+% %% PLOTTING SECTION!!!!!!!!!!!!
+% 
+% 
+% %% (0) SETUP 
+% 
+% N  = 48;                
+% NN = N;
+% n  = 1:N;
+% dt  = 0.5;
+% 
+% % grid/battery/EV powers -> energy per slot (kWh/slot)
+% Gimp   = global_Pgplus(1:N)   * dt;
+% Gexp   = global_Pgminus(1:N)  * dt;
+% Bchg   = global_Pbplus(1:N)   * dt;
+% Bdis   = global_Pbminus(1:N)  * dt;
+% EVchg  = global_Pebplus(1:N)  * dt;
+% EVdis  = global_Pebminus(1:N) * dt;
+% 
+% % demand & PV (already in kWh/slot across ALL houses)
+% Fixed  = global_PD_day1(1:N);
+% Flex   = global_Flex_KWh(1:N);
+% PVg    = global_PV_day1(1:N);
+% 
+% % efficiencies — these are constants in your runs (same for all houses)
+% etaI   = 1.0;
+% etaBc  = double(ampl.getParameter('etaBc').get());
+% etaBd  = double(ampl.getParameter('etaBd').get());
+% etaEvC = double(ampl.getParameter('etaEvC').get());
+% etaEvD = double(ampl.getParameter('etaEvD').get());
+% 
+% % AMPL balance (converted to energy): 
+% % Fixed + Flex = (Gimp - Gexp) + etaI*PV + etaI*((1/etaBd)*Bdis - etaBc*Bchg) + ((1/etaEvD)*EVdis - etaEvC*EVchg)
+% rhs = (Gimp - Gexp) ...
+%     + etaI * PVg ...
+%     + etaI * ((1/etaBd) * Bdis - etaBc * Bchg) ...
+%     + ((1/etaEvD) * EVdis - etaEvC * EVchg);
+% 
+% imbalance = (Fixed + Flex) - rhs;
+% 
+% % Handy aggregates
+% global_total_energy = global_PD_day1 + global_Flex_KWh;        % kWh/slot (demand)
+% Pgnet_global_kW     = global_Pgplus - global_Pgminus;          % kW (import - export)
+% Gimp_kWh            = global_Pgplus  * dt;                     % kWh/slot
+% Gexp_kWh            = global_Pgminus * dt;                     % kWh/slot
+% Bchg_kWh            = global_Pbplus  * dt;                     % kWh/slot (+ charge)
+% Bdis_kWh            = global_Pbminus * dt;                     % kWh/slot (+ discharge)
+% EVchg_kWh           = global_Pebplus * dt;
+% EVdis_kWh           = global_Pebminus* dt;
+% 
+% 
+% 
+% %% (1) PV vs Total demand 
+% 
+% global_total_energy = global_Flex_KWh + global_PD_day1;
+% figure('Name','Global PV vs Total demand'); hold on;
+% stairs(n, global_PV_day1,'LineWidth',1.2);                  
+% stairs(n, global_total_energy(1:N),'LineWidth',1.8);    
+% ylabel('Energy (kWh/slot)');
+% xlabel('Time (half-hours)'); title('PV Output vs. Total Demand');
+% legend({'PV Output','Total Demand'},'Location','NorthWest');
+% set(gca,'FontSize',10,'XTick',2*[0 6 12 18 24],'XTickLabel',{'0','6','12','18','24'},'XLim',[1 N]);
+% grid on; box on; hold off;
+% 
+% %% (2) Fixed vs Flexible 
+% 
+% figure('Name','GLOBAL: Fixed vs Flexible','Color','w'); hold on;
+% stairs(n, global_PD_day1,  'k', 'LineWidth', 1.2);   % Fixed (kWh/slot)
+% stairs(n, global_Flex_KWh, 'b', 'LineWidth', 1.2);   % Flexible (kWh/slot)
+% title('Global Demand: Fixed (Black) and Flexible (Blue)');
+% set(gca,'FontSize',10, ...
+%         'XTick',      2*[0 6 12 18 24], ...
+%         'XTickLabel', {'0','6','12','18','24'});
+% ymax = max([global_PD_day1(:); global_Flex_KWh(:); eps]);
+% xlim([1 NN]); 
+% ylim([0 1.1*ymax]);
+% xlabel('Hours'); 
+% ylabel('E (kWh/slot)');
+% box on; grid on;
+% legend({'Fixed','Flexible (Post-HEMS)'}, 'Location','NorthWest');
+% hold off;
+% 
+% %% (3) Residuals CHECKKKK 
+% 
+% fprintf('GLOBAL power balance: max|imbalance| = %.3e kWh/slot\n', max(abs(imbalance)));
+% %figure; stem(1:N, imbalance); yline(0,'k:'); grid on; title('Global balance residual (kWh/slot)');
+% 
+% %% (4) Demonstration of Post-HEMS Movement 
+% 
+% % Background Settings 
+% cPre  = [0.85 0.10 0.10];   % red
+% cPost = [0.10 0.55 0.20];   % green
+% aFill = 0.20;               % fill transparency
+% pre  = global_flexy_base(:);
+% post = global_Flex_KWh(:);
+% N    = numel(pre);
+% figure('Name','Flexible Loads: Pre vs Post HEMS Implementation','Color','w'); hold on
+% set(gca,'Layer','top');                    % grid on top; patches underneath
+% legend('AutoUpdate','off');                % we'll add legend entries explicitly
+% 
+% % --- shaded bins (behind the lines) ---
+% for i = 1:N
+%     xpoly = [i i i+1 i+1];
+%     if post(i) > pre(i)
+%         patch(xpoly,[pre(i) post(i) post(i) pre(i)], cPost, ...
+%               'FaceAlpha',aFill,'EdgeColor','none');           % added after HEMS
+%     elseif post(i) < pre(i)
+%         patch(xpoly,[post(i) pre(i) pre(i) post(i)], cPre, ...
+%               'FaceAlpha',aFill,'EdgeColor','none');           % removed vs baseline
+%     end
+% end
+% 
+% % --- lines ---
+% hPre  = stairs(1:N, pre,  ':', 'Color',cPre,  'LineWidth',1.8);
+% hPost = stairs(1:N, post, '-', 'Color',cPost, 'LineWidth',2.2);
+% 
+% % --- create 2 dummy patches just for the legend ---
+% hAdd = patch(nan,nan,cPost,'FaceAlpha',aFill,'EdgeColor','none');
+% hRem = patch(nan,nan,cPre, 'FaceAlpha',aFill,'EdgeColor','none');
+% 
+% % --- axes cosmetics ---
+% title('Flexible Demand: Pre vs. Post HEMS Implementation');
+% xlabel('Hour of Day'); ylabel('kWh per 30-min slot');
+% if ~exist('dt','var'), dt = 0.5; end
+% xticks(0:2/dt:24/dt); xticklabels(string(0:2:24));
+% grid on; box on; xlim([1 N]); ylim([0 1.08*max([pre;post;eps])]);
+% 
+% % --- legend (order: fills then lines) ---
+% legend([ hRem hPre hAdd hPost], ...
+%        {'', 'Pre-HEMS', '', 'Post-HEMS'}, ...
+%        'Location','northoutside','Orientation','horizontal');
+% 
+% Epre = sum(pre,'omitnan'); Epost = sum(post,'omitnan');  % kWh/slot assumed
+% text(0.99,0.98, sprintf('Area under curves:\nPre  = %.2f\nPost = %.2f',Epre,Epost), ...
+%      'Units','normalized','Horiz','right','Vert','top','BackgroundColor','w','Margin',6);
+% 
+% 
+% 
+% 
+% %%
+% %% KPIs: Peak shaving, timing, solar-window share, and hollow-out
+% 
+% % --- time axis (slot centers) ---
+% if ~exist('dt','var') || isempty(dt), dt = 0.5; end            % hours/slot
+% H = (0:dt:24-dt)';                                             % 0..24h, length N
+% assert(numel(H)==N,'Time axis length must match pre/post.');
+% 
+% % --- windows ---
+% pm_win   = (H >= 15 & H < 21);   % 15:00–21:00 (evening)
+% am_win   = (H >= 7  & H < 9 );   % 07:00–09:00 (morning)
+% solarWin = (H >= 10 & H < 16);   % 10:00–16:00 (solar window)
+% 
+% % ========== (1) Peak height reduction in 15:00–21:00 ==========
+% [Pk_pre_PM,  idx_pre_PM_rel]  = max(pre(pm_win));
+% [Pk_post_PM, idx_post_PM_rel] = max(post(pm_win));
+% idx_pm = find(pm_win);                                        % map back to full index
+% t_pre_PM  = H(idx_pm(idx_pre_PM_rel));
+% t_post_PM = H(idx_pm(idx_post_PM_rel));
+% dPk_PM    = Pk_pre_PM - Pk_post_PM;
+% pct_dPkPM = 100 * dPk_PM / max(Pk_pre_PM, eps);
+% 
+% % ========== (2) Peak timing shift (evening window + overall) ==========
+% % dT_PM = t_post_PM - t_pre_PM;                                  % hours (+ means later)
+% [Pk_pre_all,  i_pre_all]  = max(pre);   t_pre_all  = H(i_pre_all);
+% [Pk_post_all, i_post_all] = max(post);  t_post_all = H(i_post_all);
+% % dT_all = t_post_all - t_pre_all;
+% 
+% % ========== (3) Share of flexible demand in solar window ==========
+% S_pre  = sum(pre(solarWin),'omitnan')  / sum(pre,'omitnan');
+% S_post = sum(post(solarWin),'omitnan') / sum(post,'omitnan');
+% dS     = S_post - S_pre;                                        % absolute change (pp as fraction)
+% 
+% % ========== (4) Hollow-out / gain indices (kWh moved) ==========
+% Hollow_AM  = sum(max(pre(am_win)  - post(am_win),  0), 'omitnan');  % removed from 07:00–09:00
+% Hollow_PM  = sum(max(pre(pm_win)  - post(pm_win),  0), 'omitnan');  % removed from 15:00–21:00
+% Gain_Solar = sum(max(post(solarWin) - pre(solarWin), 0), 'omitnan');% added to 10:00–16:00
+% 
+% % ========== Optional: centroid shift (whole-day movement) ==========
+% mu_pre  = sum(H .* pre,'omitnan')  / sum(pre,'omitnan');
+% mu_post = sum(H .* post,'omitnan') / sum(post,'omitnan');
+% dMu     = mu_post - mu_pre;                                     % hours
+% 
+% % --- print nicely ---
+% fprintf('\nAGGREGATE FLEXIBLE DEMAND KPIs\n');
+% fprintf('Peak (15:00–21:00): pre %.2f → post %.2f kWh/slot  |  Δ=%.2f (%.1f%%)\n', ...
+%         Pk_pre_PM, Pk_post_PM, dPk_PM, pct_dPkPM);
+% % fprintf('Peak time shift (15:00–21:00): %s → %s  |  ΔT=%.2f h\n', ...
+% %         datestr(t_pre_PM/24,'HH:MM'), datestr(t_post_PM/24,'HH:MM'), dT_PM);
+% % fprintf('Overall max time shift:        %s → %s  |  ΔT=%.2f h\n', ...
+% %         datestr(t_pre_all/24,'HH:MM'), datestr(t_post_all/24,'HH:MM'), dT_all);
+% fprintf('Solar-window share (10:00–16:00): pre %.1f%% → post %.1f%%  |  Δ=%.1f pp\n', ...
+%         100*S_pre, 100*S_post, 100*dS);
+% fprintf('Hollow-out (removed):  AM 07:00–09:00 = %.1f kWh,  PM 15:00–21:00 = %.1f kWh\n', ...
+%         Hollow_AM, Hollow_PM);
+% fprintf('Midday gain (added):   10:00–16:00     = %.1f kWh\n', Gain_Solar);
+% fprintf('Energy centroid shift (whole day): Δμ = %.2f h toward midday\n\n', dMu);
+% 
+% 
+% 
+% 
+% %% (5) Subplot 
+% 
+% n   = (1:N)';                  % slots
+% t_h = (0:N-1)'*dt;             % hours 0..24
+% xt  = 0:2:24;
+% 
+% % Cohort-average SOCs if available (avoid divide-by-zero)
+% if exist('house_count','var') && house_count>0
+%     Be_avg_kWh  = global_Be  / house_count;     % average BESS SoC (kWh)
+%     EEv_avg_kWh = global_eev / house_count;     % average EV SoC  (kWh)
+% else
+%     Be_avg_kWh  = zeros(N,1);
+%     EEv_avg_kWh = zeros(N,1);
+% end
+% if ~exist('dt','var'),  dt  = 0.5; end
+% if ~exist('N','var'),   N   = 48;  end
+% if ~exist('t_h','var') || numel(t_h)~=N, t_h = (0:N-1)'*dt; end
+% xt = 0:2:24;
+% 
+% fig = figure('Name','Alignment (4x1)','Color','w','Units','centimeters','Position',[2 2 22 22]);
+% 
+% % --- (1) Tariff ---
+% subplot(3,1,1);
+% stairs(t_h, price_vec, 'LineWidth',1.8);
+% title('Retail TOU Tariff'); ylabel('$/kWh');
+% xlabel('Hour'); set(gca,'XTick',xt,'XLim',[0 24]); grid on; box on;
+% 
+% % --- (2) PV vs Net Grid Import (global, both in kWh/slot) ---
+% subplot(3,1,2); hold on;
+% net_import_kWh = (global_Pgplus(1:N) - global_Pgminus(1:N)) * dt;  
+% stairs(t_h, global_PV_day1(1:N), 'LineWidth',1.6);                 % PV (kWh/slot)
+% stairs(t_h, net_import_kWh,      'LineWidth',1.8);                 % Net grid import (kWh/slot)
+% yline(0,'k:');
+% title('Global PV Output vs Net Grid Import');
+% ylabel('kWh/slot'); xlabel('Hour');
+% legend({'PV Output','Net Grid Import'}, 'Location','northeast');
+% set(gca,'XTick',xt,'XLim',[0 24]); grid on; box on;
+% 
+% % --- (3) BESS SoC (cohort average) ---
+% subplot(3,1,3);
+% plot(t_h, Be_avg_kWh, 'LineWidth',1.8);
+% title('Average BESS SOC'); ylabel('kWh'); xlabel('Hour');
+% set(gca,'XTick',xt,'XLim',[0 24]); grid on; box on;
+% 
+% % Style touch-up
+% set(findall(fig,'Type','axes'),'FontName','Helvetica');
+% 
+% %% BESS ONLY PLOT 
+% 
+% % ---- Defaults / timebase -------------------------------------------------
+% if ~exist('dt','var'), dt = 0.5; end                 % hours per slot
+% if ~exist('N','var'),  N  = 48;  end                 % number of slots
+% if ~exist('t_h','var') || numel(t_h) ~= N
+%     t_h = (0:N-1)' * dt;                             % hours 0..24
+% end
+% xt = 0:2:24;
+% 
+% % ---- Cohort-average BESS SoC (kWh) ---------------------------------------
+% if exist('house_count','var') && house_count > 0 && exist('global_Be','var')
+%     Be_avg_kWh = global_Be(:) / house_count;
+% else
+%     Be_avg_kWh = zeros(N,1);
+% end
+% Be_avg_kWh = Be_avg_kWh(1:N);                        % guard length
+% 
+% % ---- Plot: BESS SoC only --------------------------------------------------
+% fig = figure('Name','BESS SoC','Color','w', ...
+%              'Units','centimeters','Position',[2 2 22 12]);
+% 
+% plot(t_h, Be_avg_kWh, 'LineWidth', 1.8);
+% ylabel('Average State-of-Charge (kWh)'); xlabel('Time (Hour)');
+% set(gca, 'XTick', xt, 'XLim', [0 24]); grid on; box on;
+% 
+% set(findall(fig,'Type','axes'), 'FontName', 'Helvetica');
+% 
+% %% (6) Global Fixed vs Flex vs EV charge vs BESS charge (kWh/slot)
+% 
+% if ~exist('N','var'),  N  = 48; end
+% if ~exist('dt','var'), dt = 0.5; end
+% t_h = (0:N-1)'*dt;
+% 
+% Fixed_kWh = global_PD_day1(1:N);                 % fixed demand (kWh/slot)
+% Flex_kWh  = global_Flex_KWh(1:N);                % flexible demand post-HEMS (kWh/slot)
+% EVchg_kWh = global_Pebplus(1:N) * dt;            % EV charging energy/slot
+% Bchg_kWh  = global_Pbplus(1:N) * dt;             % BESS charging energy/slot
+% 
+% figure('Name','Global demand components','Color','w','Units','centimeters','Position',[4 4 20 9]); hold on;
+% stairs(t_h, Fixed_kWh, 'k-',  'LineWidth',1.6);          % black solid
+% stairs(t_h, Flex_kWh,  'b-',  'LineWidth',1.8);          % blue solid
+% stairs(t_h, EVchg_kWh, '--',  'LineWidth',1.6);          % default color, dashed
+% stairs(t_h, Bchg_kWh,  ':',   'LineWidth',1.8);          % default color, dotted
+% xlabel('Hour'); ylabel('kWh/slot');
+% title('Global Fixed, Flexible, EV Charging, and BESS Charging Demand');
+% legend({'Fixed demand','Flexible demand (Post-HEMS)','EV charging','BESS charging'}, 'Location','northeast');
+% set(gca,'XTick',0:2:24,'XLim',[0 24]); grid on; box on;
+% 
+% 
+% %% (8) Global net grid import (kW) = Pgplus - Pgminus
+% 
+% if ~exist('N','var'),  N = 48; end
+% if ~exist('dt','var'), dt = 0.5; end
+% t_h = (0:N-1)'*dt;
+% net_kW = (global_Pgplus(1:N) - global_Pgminus(1:N));  % kW
+% figure('Name','Global net grid import','Color','w','Units','centimeters','Position',[4 4 18 7]);
+% stairs(t_h, net_kW, 'LineWidth',1.8);
+% yline(0,'k:');
+% xlabel('Time (Hour)'); ylabel('Power Demanded from the Grid kW');
+% %title('Aggregate Net Grid Import (Positive = Import, Negative = Export)');
+% set(gca,'XTick',0:2:24,'XLim',[0 24]); grid on; box on;
+% 
+% 
+% %% (9) GLOBAL: Fixed + Baseline Flex (pre-HEMS) and their Total
+% 
+% n  = 1:N;
+% Fixed_kWh = global_PD_day1(:);       % fixed demand (kWh/slot)
+% Flex_base = global_flexy_base(:);    % baseline flex (pre-HEMS) (kWh/slot)
+% Total_kWh = Fixed_kWh + Flex_base;   % total baseline demand
+% 
+% figure('Name','GLOBAL: Fixed + Baseline Flex + Total','Color','w'); hold on;
+% stairs(n, Fixed_kWh, 'k-',  'LineWidth',1.2);   % Fixed
+% stairs(n, Flex_base, 'r--', 'LineWidth',1.4);   % Baseline flex (pre-HEMS)
+% stairs(n, Total_kWh, 'b-',  'LineWidth',1.6);   % Total (Fixed + Baseline flex)
+% title('Global Demand: Fixed (Black), Baseline Flex (Red dotted), Total (Blue)');
+% set(gca,'FontSize',10, 'XTick',2*[0 6 12 18 24], 'XTickLabel',{'0','6','12','18','24'});
+% ymax = max([Fixed_kWh; Flex_base; Total_kWh; eps]);
+% xlim([1 N]); 
+% ylim([0 1.1*ymax]);
+% xlabel('Hours'); 
+% ylabel('E (kWh/slot)');
+% box on; grid on;
+% legend({'Fixed','Baseline Flex (pre-HEMS)','Total (pre-HEMS)'}, 'Location','NorthWest');
+% hold off;
+% 
+% 
+% %% (10) GLOBAL: Two-panel comparison — Baseline vs Post-HEMS totals
+% 
+% N  = 48;                 % 30-min slots
+% n  = 1:N;
+% Fixed_kWh   = global_PD_day1(:);       % fixed demand (kWh/slot)
+% Flex_base   = global_flexy_base(:);    % baseline flex (pre-HEMS)
+% Flex_post   = global_Flex_KWh(:);      % flexible (post-HEMS)
+% Total_base  = Fixed_kWh + Flex_base;   % total baseline
+% Total_post  = Fixed_kWh + Flex_post;   % total after HEMS
+% 
+% % common y-scale for apples-to-apples comparison
+% ymax_all = max([Fixed_kWh; Flex_base; Total_base; Flex_post; Total_post; eps]);
+% 
+% fig = figure('Name','GLOBAL: Baseline vs Post-HEMS (Totals)','Color','w'); 
+% 
+% % --- (1) Baseline (pre-HEMS) ---
+% subplot(2,1,1); hold on;
+% stairs(n, Fixed_kWh, 'k-',  'LineWidth',1.2);   % Fixed
+% stairs(n, Flex_base, 'r-', 'LineWidth',1.4);   % Baseline flex
+% title('Global Demand Pre-HEMS');
+% set(gca,'FontSize',10, 'XTick',2*[0 6 12 18 24], 'XTickLabel',{'0','6','12','18','24'});
+% xlim([1 N]); ylim([0 1.1*ymax_all]);
+% xlabel('Hours'); ylabel('E (kWh/slot)');
+% box on; grid on;
+% legend({'Fixed','Baseline Flex (Pre-HEMS)'}, 'Location','NorthWest');
+% 
+% % --- (2) Post-HEMS ---
+% subplot(2,1,2); hold on;
+% stairs(n, Fixed_kWh, 'k-',  'LineWidth',1.2);   % Fixed
+% stairs(n, Flex_post, 'g-', 'LineWidth',1.4);   % Post-HEMS flex (same style for direct swap)
+% title('Global Demand Post-HEMS');
+% set(gca,'FontSize',10, 'XTick',2*[0 6 12 18 24], 'XTickLabel',{'0','6','12','18','24'});
+% xlim([1 N]); ylim([0 1.1*ymax_all]);
+% xlabel('Hours'); ylabel('E (kWh/slot)');
+% box on; grid on;
+% legend({'Fixed','Flexible (Post-HEMS)'}, 'Location','NorthWest');
+% 
+% 
+% 
+% %% (11) GLOBAL: Two-panel comparison — Baseline vs Post-HEMS totals
+% 
+% N  = 48;                 % 30-min slots
+% n  = 1:N;
+% Fixed_kWh   = global_PD_day1(:);       % fixed demand (kWh/slot)
+% Flex_base   = global_flexy_base(:);    % baseline flex (pre-HEMS)
+% Flex_post   = global_Flex_KWh(:);      % flexible (post-HEMS)
+% Total_base  = Fixed_kWh + Flex_base;   % total baseline
+% Total_post  = Fixed_kWh + Flex_post;   % total after HEMS
+% 
+% % common y-scale for apples-to-apples comparison
+% ymax_all = max([Fixed_kWh; Flex_base; Total_base; Flex_post; Total_post; eps]);
+% 
+% fig = figure('Name','GLOBAL: Baseline vs Post-HEMS (Totals)','Color','w'); 
+% 
+% % --- (1) Baseline (pre-HEMS) ---
+% subplot(2,1,1); hold on;
+% stairs(n, Fixed_kWh, 'k-',  'LineWidth',1.2);   % Fixed
+% stairs(n, Flex_base, 'r--', 'LineWidth',1.4);   % Baseline flex
+% stairs(n, Total_base,'b-',  'LineWidth',1.6);   % Total (baseline)
+% title('Global Demand Pre-HEMS');
+% set(gca,'FontSize',10, 'XTick',2*[0 6 12 18 24], 'XTickLabel',{'0','6','12','18','24'});
+% xlim([1 N]); ylim([0 1.1*ymax_all]);
+% xlabel('Hours'); ylabel('E (kWh/slot)');
+% box on; grid on;
+% legend({'Fixed','Flexible (Pre-HEMS)','Total'}, 'Location','NorthWest');
+% 
+% % --- (2) Post-HEMS ---
+% subplot(2,1,2); hold on;
+% stairs(n, Fixed_kWh, 'k-',  'LineWidth',1.2);   % Fixed
+% stairs(n, Flex_post, 'r--', 'LineWidth',1.4);   % Post-HEMS flex (same style for direct swap)
+% stairs(n, Total_post,'b-',  'LineWidth',1.6);   % Total (post-HEMS)
+% title('Global Demand Post-HEMS');
+% set(gca,'FontSize',10, 'XTick',2*[0 6 12 18 24], 'XTickLabel',{'0','6','12','18','24'});
+% xlim([1 N]); ylim([0 1.1*ymax_all]);
+% xlabel('Hours'); ylabel('E (kWh/slot)');
+% box on; grid on;
+% legend({'Fixed','Flexible (Post-HEMS)','Total'}, 'Location','NorthWest');
+% 
+% 
+% 
+% %% PRINTING 
+% %% === SAVE ALL OPEN FIGURES ===
+% % Creates /plots under basef and saves each open figure by its plot number.
+% 
+% % Where to put the images
+% outdir = fullfile(basef, 'plots');
+% if ~exist(outdir,'dir'), mkdir(outdir); end
+% 
+% % Find and sort figures by their numeric ID
+% figs = findall(0,'Type','figure');
+% [~,ix] = sort([figs.Number]);
+% figs = figs(ix);
+% 
+% nSaved = 0;
+% for k = 1:numel(figs)
+%     f = figs(k);
+% 
+%     % Build a clean filename: plot_###[_Name]
+%     numStr = sprintf('%03d', f.Number);
+%     figName = "";
+%     try
+%         nm = string(get(f,'Name'));
+%         if strlength(nm) > 0
+%             % sanitize name to be filesystem-safe
+%             nm = regexprep(nm, '[^\w\- ]', '');
+%             nm = strtrim(regexprep(nm, '\s+', '_'));
+%             figName = "_" + nm;
+%         end
+%     catch
+%         % ignore if Name not set
+%     end
+%     baseName = sprintf('plot_%s%s', numStr, figName);
+% 
+%     % Full paths
+%     pngfile = fullfile(outdir, baseName + ".png");
+%     pdffile = fullfile(outdir, baseName + ".pdf");
+%     figfile = fullfile(outdir, baseName + ".fig");
+% 
+%     % Make sure layout matches on-screen
+%     try, set(f,'PaperPositionMode','auto'); catch, end
+% 
+%     % Save (use exportgraphics when available; fall back otherwise)
+%     try
+%         exportgraphics(f, pngfile, 'Resolution', 300);
+%         exportgraphics(f, pdffile, 'ContentType', 'vector');
+%     catch
+%         saveas(f, pngfile);           % fallback PNG
+%         try, print(f, '-dpdf', pdffile); catch, end
+%     end
+%     try, savefig(f, figfile); catch, end
+% 
+%     nSaved = nSaved + 1;
+% end
+% 
+% fprintf('Saved %d figures to %s\n', nSaved, outdir);
+% 
+% 
+
+
+
+
+%% Helper
+
+
+function vec = read_var(ampl, vname)
+    % Returns the variable's .val column as a MATLAB double vector.
+    df = ampl.getVariable(vname).getValues();
+    try
+        vec = df.getColumnAsDoubles([vname '.val']);   % new AMPL API
+    catch
+        vec = df.getColumnAsDoubles('val');            % old AMPL API fallback
+    end
+end
+

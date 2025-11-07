@@ -1,0 +1,191 @@
+
+
+# HEMS OPTIMISER
+
+# SETS
+
+set D ordered;             # <-- make D ordered so first/last/ord/prev work
+set J ordered;                     # flexible appliances
+
+
+
+
+# PARAMETERS
+
+param dt = 24 / 48;       # 0.5 h time step
+param N >= 1;             # number of time steps
+# Tariffs
+param c_g{d in D} >= 0;           # retail import tariff ($/kWh)
+param c_pv >= 0 default 0.04;     # feed-in tariff ($/kWh)
+# Demand / PV / grid capacity
+param Pd{d in D} >= 0;            # fixed household demand (kW)
+param Ppv{d in D} >= 0;           # PV output (kW)
+param PgM >= 0 default 15;        # grid connection limit (kW)
+param etaI   >= 0, <= 1 default 1;# inverter efficiency for PV to AC
+# Flexible appliances
+param Pload{J} >= 0;              # rated power (kW)
+param R{J}        integer >= 1;
+param tau_min{J}  integer >= 1;
+param tau_max{J}  integer >= 1;
+# Stationary battery (home BESS)
+param ebM >= 0;                   # max energy (kWh)
+param ebm >= 0;                   # min energy (kWh)
+param eb1 >= 0;                   # initial SOC (kWh)
+param ebN >= 0;                   # terminal SOC target (kWh)
+param PbM >= 0;                   # max charge power (kW)
+param Pbm >= 0;                   # max discharge power (kW)
+param etaBc  >= 0, <= 1;                 # charge eff
+param etaBd  >= 0, <= 1;                 # discharge eff
+# EV parameters
+param eevM   >= 0;                # EV max energy (kWh)
+param eevm   >= 0;                # EV min energy (kWh)
+param eev1   >= 0;                # initial SOC (kWh)
+param eevN   >= 0 default 0;      # terminal SOC lower bound (kWh)
+param PcevM  >= 0;                # EV max charge power (kW)
+param PdevM  >= 0;                # EV max discharge power (kW)
+param etaEvC >= 0, <= 1 default 0.95;   # EV charge eff
+param etaEvD >= 0, <= 1 default 0.95;   # EV discharge eff
+#param avail_ev{d in D} integer, >= 0, <= 1 default 0;
+param avail_ev{d in D} >= 0, <= 1, default 0;
+param dep_soc{d in D} >= 0 default 0;      # departure SoC requirement at slot d (kWh), 0 otherwise
+param gamma >= 0 default 10.0;    # $/kWh penalty for shortfall (tune high)
+# degradation cost params (throughput-based $/kWh)
+param lambda_batt >= 0 default 0;
+param lambda_ev   >= 0 default 0;
+
+
+
+# VARIABLES
+
+# Grid
+var Pgplus{d in D}  >= 0, <= PgM;        # import (kW)
+var Pgminus{d in D} >= 0, <= PgM;        # export (kW)
+var dg{d in D} binary;                   # 1 if importing, 0 if exporting
+# Stationary battery power/energy
+var Pbplus{d in D}  >= 0, <= PbM;        # charge (kW)
+var Pbminus{d in D} >= 0, <= Pbm;        # discharge (kW)
+var eb{d in D} >= ebm, <= ebM;           # SOC (kWh)
+var sb{d in D} binary;                   # charge(1)/discharge(0) selector
+# EV power/energy
+var Pebplus{d in D}  >= 0, <= PcevM;     # EV charge (kW)
+var Pebminus{d in D} >= 0, <= PdevM;     # EV discharge (kW)
+var eev{d in D} >= eevm, <= eevM;        # EV SOC (kWh)
+var sbev{d in D} binary;                 # EV charge(1)/discharge(0)
+var unmet_dep{d in D} >= 0;              # kWh shortfall at departure slots
+# Appliances
+var xa{j in J, t in D} binary;           # ON/OFF
+var start{j in J, t in D} binary;        # start trigger
+
+
+
+# OBJECTIVE
+minimize MinCost:
+  sum {d in D} dt * (
+        c_g[d] * Pgplus[d]
+      - c_pv    * Pgminus[d]
+      + lambda_batt * (Pbplus[d] + Pbminus[d])
+      + lambda_ev   * (Pebplus[d] + Pebminus[d])
+  )
+  + gamma * sum{d in D} unmet_dep[d];
+
+
+
+# CONSTRAINTS
+
+subject to PowerBalance {t in D}:
+  Pgplus[t] - Pgminus[t]
+  =
+    # Battery contribution (Azuatalam style: efficiencies inside power balance)
+    etaI * ( etaBc * Pbplus[t] - (1/etaBd) * Pbminus[t] )
+
+    # PV , with curtailment handled explicitly
+    - etaI * ( Ppv[t] ) 
+
+    # Fixed + flexible demand
+    + Pd[t] + sum {j in J} Pload[j] * xa[j,t]
+
+    # EV treated analogously to battery (charger efficiencies explicit)
+    + ( etaEvC * Pebplus[t] - (1/etaEvD) * Pebminus[t] )
+  ;
+
+# Grid direction gating
+subject to GridImportDir {d in D}:
+  Pgplus[d] <= PgM * dg[d];
+
+subject to GridExportDir {d in D}:
+  Pgminus[d] <= PgM * (1 - dg[d]);
+
+# Battery direction gating
+subject to BattChargeDir {d in D}:
+  Pbplus[d] <= PbM * sb[d];
+
+subject to BattDischDir {d in D}:
+  Pbminus[d] <= Pbm * (1 - sb[d]);
+
+# Battery SOC
+/*subject to BattInit:
+  eb[first(D)] = eb1 + dt * ( etaBc * Pbplus[first(D)] - (1/etaBd) * Pbminus[first(D)] );
+*/
+subject to BattInit:
+  eb[first(D)] = eb1;
+
+
+/*subject to BattDyn {d in D: ord(d) >= 2}:
+  eb[d] = eb[prev(d)]
+          + dt * ( etaBc * Pbplus[d] - (1/etaBd) * Pbminus[d] );
+*/
+subject to BattDyn {d in D: ord(d) >= 2}:
+  eb[d] = eb[prev(d)]
+          + dt * ( etaBc * Pbplus[prev(d)] - (1/etaBd) * Pbminus[prev(d)] );
+/*
+subject to BattEnd:
+  eb[last(D)] >= ebN;
+  */
+subject to BattEnd:
+  eb[last(D)] = ebN;
+ 
+
+# EV direction/availability
+subject to EvChargeDir {d in D}:
+  Pebplus[d] <= PcevM * sbev[d] * avail_ev[d];
+
+subject to EvDischDir {d in D}:
+  Pebminus[d] <= PdevM * (1 - sbev[d]) * avail_ev[d];
+
+# EV SOC
+/*subject to EvInit:
+  eev[first(D)] = eev1 + dt * ( etaEvC * Pebplus[first(D)] - (1/etaEvD) * Pebminus[first(D)] );
+*/
+subject to EvInit:
+  eev[first(D)] = eev1;
+
+/*
+subject to EvDyn {d in D: ord(d) >= 2}:
+  eev[d] = eev[prev(d)]
+           + dt * ( etaEvC * Pebplus[d] - (1/etaEvD) * Pebminus[d] );
+  */
+subject to EvDyn {d in D: ord(d) >= 2}:
+  eev[d] = eev[prev(d)]
+           + dt * ( etaEvC * Pebplus[prev(d)] - (1/etaEvD) * Pebminus[prev(d)] );
+     
+           
+# EV terminal SOC lower bound
+subject to EvEnd:
+  eev[last(D)] >= eevN;
+
+# EV departure SOC (hard, where specified)
+subject to EvDepartureReq {d in D: dep_soc[d] > 0}:
+  eev[d] + unmet_dep[d] >= dep_soc[d];
+
+# Appliance logic
+subject to SingleStart {j in J}:
+  sum {t in tau_min[j] .. (tau_max[j] - R[j] + 1)} start[j, t] = 1;
+
+subject to ContiguousRun {j in J, t in D}:
+  xa[j, t] = sum {s in tau_min[j] .. (tau_max[j] - R[j] + 1):
+                   t >= s and t < s + R[j]} start[j, s];
+
+subject to StartWindowZero {j in J, t in D:
+  t < tau_min[j] or t > tau_max[j] - R[j] + 1}:
+  start[j, t] = 0;
+
